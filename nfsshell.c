@@ -219,6 +219,7 @@ jmp_buf intenv;                 /* where to go in interrupts */
 void interrupt(int);
 int command(char *);
 int ngetline(char *, int, int *, char **, int);
+int split_path(char *, nfs_fh3 *, char **);
 #ifdef READLINE
 char **nfs_completion(const char *, int, int);
 #endif
@@ -876,6 +877,64 @@ do_lcd(int argc, char **argv)
 }
 
 /*
+ * Resolve PATH to the directory handle that contains it; return the final
+ * component in *basep. "a/b/c" -> handle of a/b with *basep="c"; a bare name
+ * -> current directory with *basep=path; a leading '/' starts at the mount
+ * root. Returns 1 on success. NOTE: writes NULs into PATH at '/'s, so callers
+ * must pass a writable string (argv entries are writable).
+ */
+int
+split_path(char *path, nfs_fh3 *dirout, char **basep)
+{
+    char *slash, *p, *component;
+    nfs_fh3 handle;
+    LOOKUP3args args = { 0 };
+    LOOKUP3res *res;
+
+    slash = strrchr(path, '/');
+    if (slash == NULL) {                 /* simple name in current directory */
+        nfs_fh3copy(dirout, &directory_handle);
+        *basep = path;
+        return 1;
+    }
+
+    if (path[0] == '/') {                /* absolute: start at export root */
+        fhandle3_to_nfs_fh3(&handle, &mountpoint->mountres3_u.mountinfo.fhandle);
+        p = path + 1;
+    } else {                             /* relative: start at current dir */
+        nfs_fh3copy(&handle, &directory_handle);
+        p = path;
+    }
+
+    *slash = '\0';                       /* split into parent path | basename */
+    *basep = slash + 1;
+
+    while (p < slash) {                  /* walk the parent components */
+        for (component = p; *p != '/' && *p != '\0'; p++)
+            /* scan */;
+        if (*p == '/') *p++ = '\0';
+        if (*component == '\0') continue;
+        args.what.name = component;
+        nfs_fh3copy(&args.what.dir, &handle);
+        if ((res = nfs3_lookup_3(&args, nfsclient)) == NULL) {
+            clnt_perror(nfsclient, "nfs3_lookup");
+            return 0;
+        }
+        if (res->status != NFS3_OK) {
+            fprintf(stderr, "%s: %s\n", component, nfs_error(res->status));
+            return 0;
+        }
+        if (res->LOOKUP3res_u.resok.obj_attributes.post_op_attr_u.attributes.type != NF3DIR) {
+            fprintf(stderr, "%s: not a directory\n", component);
+            return 0;
+        }
+        nfs_fh3copy(&handle, &res->LOOKUP3res_u.resok.object);
+    }
+    nfs_fh3copy(dirout, &handle);
+    return 1;
+}
+
+/*
  * Display a remote file
  */
 void
@@ -896,9 +955,15 @@ do_cat(int argc, char **argv)
         return;
     }
 
-    /* lookup name in current directory */
-    dargs.what.name = argv[1];
-    nfs_fh3copy(&dargs.what.dir, &directory_handle);
+    /* resolve any leading path, then lookup the final component */
+    {
+        nfs_fh3 catdir;
+        char *catbase;
+        if (!split_path(argv[1], &catdir, &catbase))
+            return;
+        dargs.what.name = catbase;
+        nfs_fh3copy(&dargs.what.dir, &catdir);
+    }
     if ((dres = nfs3_lookup_3(&dargs, nfsclient)) == NULL) {
         clnt_perror(nfsclient, "nfs3_lookup");
         return;
@@ -1085,6 +1150,7 @@ do_get(int argc, char **argv)
     int iflag = 0;
     size3 offset;
     FILE *fp;
+    nfs_fh3 getdir;
 
     argv++; argc--;
     if (mountpath == NULL) {
@@ -1096,7 +1162,14 @@ do_get(int argc, char **argv)
         iflag = 1;
     }
 
-    if (!getdirentries(&directory_handle, &table, &ptr, 20))
+    /* if a single argument carries a path (dir/pattern), read that dir */
+    nfs_fh3copy(&getdir, &directory_handle);
+    if (argc == 1 && strchr(argv[0], '/') != NULL) {
+        if (!split_path(argv[0], &getdir, &argv[0]))
+            return;
+    }
+
+    if (!getdirentries(&getdir, &table, &ptr, 20))
         return;
     for (p = table; p < ptr; p++) {
         /* match before going over the wire */
@@ -1104,7 +1177,7 @@ do_get(int argc, char **argv)
 
         /* only regular files can be transfered */
         args.what.name = *p;
-        nfs_fh3copy(&args.what.dir, &directory_handle);
+        nfs_fh3copy(&args.what.dir, &getdir);
         if ((res = nfs3_lookup_3(&args, nfsclient)) == NULL) {
             clnt_perror(nfsclient, "nfs3_lookup");
             return;
