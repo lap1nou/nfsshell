@@ -63,6 +63,7 @@
 #define blkcnt_t long           /* hack alert */
 #endif
 #include <unistd.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <time.h>
 #include <rpc/rpc.h>
@@ -149,6 +150,8 @@
 #define CMD_HANDLE      26      /* handle [<file-handle>] */
 #define CMD_MKNOD       27      /* mknod <name> [b/c major minor] [p] */
 #define CMD_AUTOUID     28      /* autouid [on|off] */
+#define CMD_MGET        29      /* mget <dir> [localdir] - recursive get */
+#define CMD_LL          30      /* ll [filespec] - alias for ls -l */
 
 /*
  * Key word table
@@ -186,7 +189,9 @@ struct keyword {
     { "bye",      CMD_QUIT,     "- good bye" },
     { "handle",   CMD_HANDLE,   "[<handle>] - get/set directory file handle" },
     { "mknod",    CMD_MKNOD,    "<name> [b/c major minor] [p] - make device" },
-    { "autouid",  CMD_AUTOUID,  "[on|off] - auto-spoof uid/gid to a file's owner on access" }
+    { "autouid",  CMD_AUTOUID,  "[on|off] - auto-spoof uid/gid to a file's owner on access" },
+    { "mget",     CMD_MGET,     "<dir> [localdir] - recursively download a directory tree" },
+    { "ll",       CMD_LL,       "[filespec] - long listing (alias for ls -l)" }
 };
 
 /* run-time settable flags */
@@ -232,6 +237,9 @@ void do_cd(int, char **);
 void do_lcd(int, char **);
 void do_cat(int, char **);
 void do_ls(int, char **);
+void do_mget(int, char **);
+void do_ll(int, char **);
+char *get_prompt(void);
 void do_get(int, char **);
 void do_df(int, char **);
 void do_rm(int, char **);
@@ -362,6 +370,12 @@ main(int argc, char **argv)
         case CMD_LS:
             do_ls(argcount, argvec);
             break;
+        case CMD_LL:
+            do_ll(argcount, argvec);
+            break;
+        case CMD_MGET:
+            do_mget(argcount, argvec);
+            break;
         case CMD_GET:
             do_get(argcount, argvec);
             break;
@@ -446,6 +460,22 @@ interrupt(int signo)
  * Read a line from standard input and break
  * it up into an argument vector.
  */
+/*
+ * Build the interactive prompt. Shows the resolved server IP in parentheses
+ * once a host has been selected, e.g. "nfs (10.0.0.5)> ".
+ */
+char *
+get_prompt(void)
+{
+    static char pbuf[128];
+
+    if (remotehost != NULL)
+        snprintf(pbuf, sizeof(pbuf), "nfs (%s)> ", inet_ntoa(server_addr.sin_addr));
+    else
+        snprintf(pbuf, sizeof(pbuf), "nfs> ");
+    return pbuf;
+}
+
 int
 ngetline(char *buf, int bufsize, int *argc, char **argv, int argvsize)
 {
@@ -454,7 +484,7 @@ ngetline(char *buf, int bufsize, int *argc, char **argv, int argvsize)
 #ifdef READLINE
     if (interact) {
         char *line;
-        if ((line = readline("nfs> ")) == NULL)
+        if ((line = readline(get_prompt())) == NULL)
             return 0;
         strncpy(buf, line, bufsize);
         add_history(line);
@@ -464,7 +494,7 @@ ngetline(char *buf, int bufsize, int *argc, char **argv, int argvsize)
             return 0;
     }
 #else
-    if (interact) printf("nfs> ");
+    if (interact) printf("%s", get_prompt());
     if (fgets(buf, bufsize, stdin) == NULL)
         return 0;
 #endif
@@ -996,6 +1026,160 @@ do_cat(int argc, char **argv)
 }
 
 /*
+ * Download a single regular file to a local path.
+ */
+void
+download_file(nfs_fh3 *fh, size3 size, const char *localpath, const char *label)
+{
+    READ3args rargs = { 0 };
+    READ3res *rres;
+    FILE *fp;
+    size3 offset;
+
+    if ((fp = fopen(localpath, "w")) == NULL) {
+        fprintf(stderr, "mget: cannot create %s\n", localpath);
+        return;
+    }
+    nfs_fh3copy(&rargs.file, fh);
+    for (offset = 0; offset < size; ) {
+        rargs.offset = offset;
+        rargs.count = transfersize;
+        if ((rres = nfs3_read_3(&rargs, nfsclient)) == NULL) {
+            clnt_perror(nfsclient, "nfs3_read");
+            break;
+        }
+        if (rres->status != NFS3_OK) {
+            fprintf(stderr, "%s: %s\n", label, nfs_error(rres->status));
+            break;
+        }
+        fwrite(rres->READ3res_u.resok.data.data_val,
+               rres->READ3res_u.resok.data.data_len, 1, fp);
+        offset += rres->READ3res_u.resok.data.data_len;
+        if (rres->READ3res_u.resok.eof == TRUE)
+            break;
+        if (rres->READ3res_u.resok.data.data_len == 0)
+            break;
+    }
+    fclose(fp);
+    printf("  %s (%llu bytes)\n", localpath, (unsigned long long) offset);
+}
+
+/*
+ * Recursively mirror a remote directory (dirfh) into local directory localdir.
+ */
+void
+mget_recurse(nfs_fh3 *dirfh, const char *localdir)
+{
+    char **table, **ptr, **p;
+    LOOKUP3args args = { 0 };
+    LOOKUP3res *res;
+
+    if (mkdir(localdir, 0755) != 0 && errno != EEXIST) {
+        fprintf(stderr, "mget: cannot create local dir %s: %s\n",
+                localdir, strerror(errno));
+        return;
+    }
+    if (!getdirentries(dirfh, &table, &ptr, 20))
+        return;
+    for (p = table; p < ptr; p++) {
+        fattr3 *fa;
+        char localpath[4096];
+
+        if (strcmp(*p, ".") == 0 || strcmp(*p, "..") == 0) {
+            free(*p);
+            continue;
+        }
+        args.what.name = *p;
+        nfs_fh3copy(&args.what.dir, dirfh);
+        if ((res = nfs3_lookup_3(&args, nfsclient)) == NULL) {
+            clnt_perror(nfsclient, "nfs3_lookup");
+            free(*p);
+            continue;
+        }
+        if (res->status != NFS3_OK) {
+            fprintf(stderr, "%s: %s\n", *p, nfs_error(res->status));
+            free(*p);
+            continue;
+        }
+        fa = &res->LOOKUP3res_u.resok.obj_attributes.post_op_attr_u.attributes;
+        snprintf(localpath, sizeof(localpath), "%s/%s", localdir, *p);
+        auto_spoof(&res->LOOKUP3res_u.resok.obj_attributes, *p);
+        if (fa->type == NF3DIR) {
+            nfs_fh3 child;
+            nfs_fh3copy(&child, &res->LOOKUP3res_u.resok.object);
+            mget_recurse(&child, localpath);
+        } else if (fa->type == NF3REG) {
+            nfs_fh3 filefh;
+            size3 sz = fa->size;
+            nfs_fh3copy(&filefh, &res->LOOKUP3res_u.resok.object);
+            download_file(&filefh, sz, localpath, *p);
+        } /* symlinks / special files are skipped */
+        free(*p);
+    }
+    free(table);
+}
+
+/*
+ * Recursively download a remote directory tree (or a single file).
+ */
+void
+do_mget(int argc, char **argv)
+{
+    LOOKUP3args args = { 0 };
+    LOOKUP3res *res;
+    nfs_fh3 parent, target;
+    char path[4096], *base, *localroot;
+    fattr3 *fa;
+    size_t L;
+
+    if (mountpath == NULL) {
+        fprintf(stderr, "mget: no remote file system mounted\n");
+        return;
+    }
+    if (argc < 2 || argc > 3) {
+        fprintf(stderr, "Usage: mget <remote-dir-or-file> [local-dir]\n");
+        return;
+    }
+
+    /* copy and strip trailing slashes (split_path writes into the string) */
+    strncpy(path, argv[1], sizeof(path) - 1);
+    path[sizeof(path) - 1] = '\0';
+    L = strlen(path);
+    while (L > 1 && path[L - 1] == '/')
+        path[--L] = '\0';
+    if (path[0] == '\0')
+        strcpy(path, ".");
+
+    if (!split_path(path, &parent, &base))
+        return;
+    args.what.name = base;
+    nfs_fh3copy(&args.what.dir, &parent);
+    if ((res = nfs3_lookup_3(&args, nfsclient)) == NULL) {
+        clnt_perror(nfsclient, "nfs3_lookup");
+        return;
+    }
+    if (res->status != NFS3_OK) {
+        fprintf(stderr, "%s: %s\n", argv[1], nfs_error(res->status));
+        return;
+    }
+    auto_spoof(&res->LOOKUP3res_u.resok.obj_attributes, base);
+    fa = &res->LOOKUP3res_u.resok.obj_attributes.post_op_attr_u.attributes;
+    localroot = (argc == 3) ? argv[2] : base;
+
+    if (fa->type == NF3DIR) {
+        nfs_fh3copy(&target, &res->LOOKUP3res_u.resok.object);
+        printf("mget: mirroring %s -> %s\n", argv[1], localroot);
+        mget_recurse(&target, localroot);
+    } else if (fa->type == NF3REG) {
+        size3 sz = fa->size;
+        nfs_fh3copy(&target, &res->LOOKUP3res_u.resok.object);
+        download_file(&target, sz, localroot, base);
+    } else {
+        fprintf(stderr, "%s: not a regular file or directory\n", argv[1]);
+    }
+}
+
+/*
  * List remote directory
  */
 void
@@ -1025,6 +1209,22 @@ do_ls(int argc, char **argv)
         free(*p);
     }
     free(table);
+}
+
+/*
+ * Long listing: alias for "ls -l" (optionally followed by a filespec).
+ */
+void
+do_ll(int argc, char **argv)
+{
+    char *nargv[NARGVEC];
+    int i, n = 0;
+
+    nargv[n++] = argv[0];               /* command slot (do_ls skips argv[0]) */
+    nargv[n++] = "-l";
+    for (i = 1; i < argc && n < NARGVEC - 1; i++)
+        nargv[n++] = argv[i];
+    do_ls(n, nargv);
 }
 
 /*
