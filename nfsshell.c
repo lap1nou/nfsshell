@@ -148,6 +148,7 @@
 #define CMD_PUT         25      /* put <local-file> [<remote-file>] */
 #define CMD_HANDLE      26      /* handle [<file-handle>] */
 #define CMD_MKNOD       27      /* mknod <name> [b/c major minor] [p] */
+#define CMD_AUTOUID     28      /* autouid [on|off] */
 
 /*
  * Key word table
@@ -184,12 +185,14 @@ struct keyword {
     { "quit",     CMD_QUIT,     "- its all in the name" },
     { "bye",      CMD_QUIT,     "- good bye" },
     { "handle",   CMD_HANDLE,   "[<handle>] - get/set directory file handle" },
-    { "mknod",    CMD_MKNOD,    "<name> [b/c major minor] [p] - make device" }
+    { "mknod",    CMD_MKNOD,    "<name> [b/c major minor] [p] - make device" },
+    { "autouid",  CMD_AUTOUID,  "[on|off] - auto-spoof uid/gid to a file's owner on access" }
 };
 
 /* run-time settable flags */
 int verbose = 1;                /* verbosity flag */
 int interact = 1;               /* interactive mode */
+int autouid = 1;                /* automatic uid/gid spoofing on access */
 
 /* user provided credentials */
 int authtype = AUTH_UNIX;       /* type of authentication */
@@ -219,6 +222,8 @@ int ngetline(char *, int, int *, char **, int);
 void do_host(int, char **);
 void do_setuid(int, char **);
 void do_setgid(int, char **);
+void do_autouid(int, char **);
+void auto_spoof(post_op_attr *, const char *);
 void do_cd(int, char **);
 void do_lcd(int, char **);
 void do_cat(int, char **);
@@ -329,6 +334,9 @@ main(int argc, char **argv)
             break;
         case CMD_GID:
             do_setgid(argcount, argvec);
+            break;
+        case CMD_AUTOUID:
+            do_autouid(argcount, argvec);
             break;
         case CMD_CD:
             do_cd(argcount, argvec);
@@ -531,6 +539,64 @@ do_setgid(int argc, char **argv)
 }
 
 /*
+ * Enable/disable/query automatic uid/gid spoofing.
+ */
+void
+do_autouid(int argc, char **argv)
+{
+    if (argc > 2) {
+        fprintf(stderr, "Usage: autouid [on|off]\n");
+        return;
+    }
+    if (argc == 2) {
+        if (strcmp(argv[1], "on") == 0 || strcmp(argv[1], "1") == 0)
+            autouid = 1;
+        else if (strcmp(argv[1], "off") == 0 || strcmp(argv[1], "0") == 0)
+            autouid = 0;
+        else {
+            fprintf(stderr, "Usage: autouid [on|off]\n");
+            return;
+        }
+    }
+    printf("Automatic uid/gid spoofing is %s\n", autouid ? "on" : "off");
+}
+
+/*
+ * If automatic spoofing is enabled, silently switch the AUTH_UNIX
+ * credentials to match the owner (uid/gid) reported for an object, so a
+ * subsequent READ/traversal is performed as that owner. This automates the
+ * manual "uid <n>" / "gid <n>" dance for AUTH_SYS ("trust the client") shares.
+ * 'poa' is the post_op_attr returned by a preceding LOOKUP; if the server did
+ * not return attributes, nothing is done.
+ */
+void
+auto_spoof(post_op_attr *poa, const char *what)
+{
+    int fuid, fgid;
+
+    if (!autouid)
+        return;
+    if (poa == NULL || poa->attributes_follow != TRUE)
+        return;
+
+    fuid = poa->post_op_attr_u.attributes.uid;
+    fgid = poa->post_op_attr_u.attributes.gid;
+    if (uid == fuid && gid == fgid)
+        return;                 /* already presenting the owner's identity */
+
+    uid = fuid;
+    gid = fgid;
+    if (nfsclient) {
+        if (nfsclient->cl_auth)
+            auth_destroy(nfsclient->cl_auth);
+        nfsclient->cl_auth = create_authenticator();
+    }
+    if (verbose)
+        fprintf(stderr, "[autouid] switched to uid=%d gid=%d to access %s\n",
+                uid, gid, what ? what : "(object)");
+}
+
+/*
  * Change remote working directory
  */
 void
@@ -583,6 +649,7 @@ do_cd(int argc, char **argv)
             fprintf(stderr, "%s: is not a directory\n", component);
             return;
         }
+        auto_spoof(&res->LOOKUP3res_u.resok.obj_attributes, component);
         nfs_fh3copy(&handle, &res->LOOKUP3res_u.resok.object);
     }
     nfs_fh3copy(&directory_handle, &handle);
@@ -638,6 +705,7 @@ do_cat(int argc, char **argv)
         fprintf(stderr, "%s: is not a regular file\n", argv[1]);
         return;
     }
+    auto_spoof(&dres->LOOKUP3res_u.resok.obj_attributes, argv[1]);
     nfs_fh3copy(&rargs.file, &dres->LOOKUP3res_u.resok.object);
     for (offset = 0; offset < dres->LOOKUP3res_u.resok.obj_attributes.post_op_attr_u.attributes.size; ) {
         rargs.offset = offset;
@@ -841,6 +909,8 @@ do_get(int argc, char **argv)
         }
         if (res->LOOKUP3res_u.resok.obj_attributes.post_op_attr_u.attributes.type != NF3REG)
             continue;
+
+        auto_spoof(&res->LOOKUP3res_u.resok.obj_attributes, *p);
 
         /* ask for confirmation */
         printf("%s? ", *p);
@@ -1629,6 +1699,7 @@ do_status(int argc, char **argv)
     }
     printf("User id      : %d\n", uid);
     printf("Group id     : %d\n", gid);
+    printf("Auto uid/gid : %s\n", autouid ? "on" : "off");
     if (remotehost)
         printf("Remote host  : `%s'\n", remotehost);
     if (mountpath)
