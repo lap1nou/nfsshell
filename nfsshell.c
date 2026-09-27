@@ -219,6 +219,9 @@ jmp_buf intenv;                 /* where to go in interrupts */
 void interrupt(int);
 int command(char *);
 int ngetline(char *, int, int *, char **, int);
+#ifdef READLINE
+char **nfs_completion(const char *, int, int);
+#endif
 void do_host(int, char **);
 void do_setuid(int, char **);
 void do_setgid(int, char **);
@@ -318,6 +321,14 @@ main(int argc, char **argv)
     }
 
     signal(SIGINT, interrupt);
+
+#ifdef READLINE
+    /* enable TAB completion of command names and remote paths */
+    if (interact) {
+        rl_attempted_completion_function = nfs_completion;
+        rl_completer_word_break_characters = " \t\n";
+    }
+#endif
 
     /* interpreter's main command loop */
     if (setjmp(intenv)) putchar('\n');
@@ -484,6 +495,201 @@ command(char *cmd)
             return keyword[i].kw_value;
     return CMD_UNKNOWN;
 }
+
+#ifdef READLINE
+/*
+ * TAB-completion support.
+ *
+ * First word on the line  -> complete against the command keyword table.
+ * Arguments to put/lcd    -> complete against the LOCAL filesystem (readline's
+ *                            built-in filename completion).
+ * All other arguments     -> complete against REMOTE directory entries, by
+ *                            doing a LOOKUP/READDIR on the server. Sub-paths
+ *                            ("dir/sub/pref") are resolved component by
+ *                            component, and directories get a trailing '/'.
+ */
+
+/* Resolve a (possibly multi-component) path to a directory file handle without
+ * changing any global state. Empty path == current directory. */
+static int
+resolve_path_fh(const char *path, nfs_fh3 *out)
+{
+    nfs_fh3 handle;
+    char *work, *p, *component;
+    LOOKUP3args args = { 0 };
+    LOOKUP3res *res;
+
+    if (mountpath == NULL || nfsclient == NULL)
+        return 0;
+
+    if (path[0] == '/') {
+        fhandle3_to_nfs_fh3(&handle, &mountpoint->mountres3_u.mountinfo.fhandle);
+        path++;
+    } else
+        nfs_fh3copy(&handle, &directory_handle);
+
+    if ((work = strdup(path)) == NULL)
+        return 0;
+    p = work;
+    for (;;) {
+        if (*p == '\0') break;
+        for (component = p; *p != '/' && *p != '\0'; p++)
+            /* scan component */;
+        if (*p != '\0') *p++ = '\0';
+        if (*component == '\0') continue;          /* skip empty components */
+        args.what.name = component;
+        nfs_fh3copy(&args.what.dir, &handle);
+        if ((res = nfs3_lookup_3(&args, nfsclient)) == NULL ||
+            res->status != NFS3_OK ||
+            res->LOOKUP3res_u.resok.obj_attributes.post_op_attr_u.attributes.type != NF3DIR) {
+            free(work);
+            return 0;
+        }
+        nfs_fh3copy(&handle, &res->LOOKUP3res_u.resok.object);
+    }
+    free(work);
+    nfs_fh3copy(out, &handle);
+    return 1;
+}
+
+static int
+is_remote_dir(nfs_fh3 *dirfh, const char *name)
+{
+    LOOKUP3args args = { 0 };
+    LOOKUP3res *res;
+
+    args.what.name = (char *) name;
+    nfs_fh3copy(&args.what.dir, dirfh);
+    if ((res = nfs3_lookup_3(&args, nfsclient)) == NULL || res->status != NFS3_OK)
+        return 0;
+    return res->LOOKUP3res_u.resok.obj_attributes.post_op_attr_u.attributes.type == NF3DIR;
+}
+
+/* generator state, rebuilt on each completion (state == 0) */
+static char **cmatch = NULL;
+static int    cmatch_n = 0, cmatch_i = 0;
+
+static void
+cmatch_reset(void)
+{
+    int i;
+    for (i = 0; i < cmatch_n; i++)
+        free(cmatch[i]);
+    free(cmatch);
+    cmatch = NULL;
+    cmatch_n = cmatch_i = 0;
+}
+
+static void
+cmatch_add(char *s)
+{
+    char **grown = realloc(cmatch, (cmatch_n + 1) * sizeof(char *));
+    if (grown == NULL) { free(s); return; }
+    cmatch = grown;
+    cmatch[cmatch_n++] = s;
+}
+
+char *
+nfs_command_generator(const char *text, int state)
+{
+    static int i;
+    size_t len = strlen(text);
+
+    if (state == 0) i = 0;
+    while (i < (int)(sizeof(keyword)/sizeof(struct keyword))) {
+        const char *name = keyword[i++].kw_command;
+        if (strncmp(name, text, len) == 0)
+            return strdup(name);
+    }
+    return NULL;
+}
+
+char *
+nfs_path_generator(const char *text, int state)
+{
+    if (state == 0) {
+        nfs_fh3 dirfh;
+        char dirpart[1024];
+        const char *slash, *base;
+        char **table, **ptr, **q;
+
+        cmatch_reset();
+
+        slash = strrchr(text, '/');
+        if (slash != NULL) {
+            size_t n = (size_t)(slash - text) + 1;   /* keep the slash */
+            if (n >= sizeof(dirpart)) n = sizeof(dirpart) - 1;
+            memcpy(dirpart, text, n);
+            dirpart[n] = '\0';
+            base = slash + 1;
+        } else {
+            dirpart[0] = '\0';
+            base = text;
+        }
+
+        if (resolve_path_fh(dirpart, &dirfh) &&
+            getdirentries(&dirfh, &table, &ptr, 20)) {
+            size_t blen = strlen(base);
+            for (q = table; q < ptr; q++) {
+                if (strncmp(*q, base, blen) == 0) {
+                    int isdir = is_remote_dir(&dirfh, *q);
+                    char *cand = malloc(strlen(dirpart) + strlen(*q) + 2);
+                    if (cand != NULL) {
+                        strcpy(cand, dirpart);
+                        strcat(cand, *q);
+                        if (isdir) strcat(cand, "/");
+                        cmatch_add(cand);
+                    }
+                }
+                free(*q);
+            }
+            free(table);
+        }
+        cmatch_i = 0;
+    }
+
+    if (cmatch_i < cmatch_n)
+        return strdup(cmatch[cmatch_i++]);
+    return NULL;
+}
+
+char **
+nfs_completion(const char *text, int start, int end)
+{
+    int fnb, i;
+    char cmd[64];
+
+    (void) end;
+    rl_attempted_completion_over = 1;   /* by default: no local-filename fallback */
+
+    for (fnb = 0; rl_line_buffer[fnb] == ' ' || rl_line_buffer[fnb] == '\t'; fnb++)
+        /* find first non-blank */;
+
+    /* completing the command word itself */
+    if (start == fnb) {
+        rl_completion_append_character = ' ';
+        return rl_completion_matches(text, nfs_command_generator);
+    }
+
+    /* which command are we completing arguments for? */
+    for (i = 0; i < (int)sizeof(cmd) - 1 && rl_line_buffer[fnb + i] &&
+                rl_line_buffer[fnb + i] != ' ' && rl_line_buffer[fnb + i] != '\t'; i++)
+        cmd[i] = rl_line_buffer[fnb + i];
+    cmd[i] = '\0';
+
+    /* put/lcd operate on LOCAL paths -> let readline complete local filenames */
+    if (strcmp(cmd, "put") == 0 || strcmp(cmd, "lcd") == 0) {
+        rl_attempted_completion_over = 0;
+        return NULL;
+    }
+
+    if (mountpath == NULL)              /* nothing mounted: no remote names yet */
+        return NULL;
+
+    rl_completion_append_character = '\0';  /* we add '/' to directories ourselves */
+    return rl_completion_matches(text, nfs_path_generator);
+}
+#endif /* READLINE */
 
 /*
  * Set remote host and initialize RPC channel
